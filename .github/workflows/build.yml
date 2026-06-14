@@ -1,0 +1,87 @@
+name: Build EDK2 OVMF
+
+on:
+  schedule:
+    - cron: '15 12 * * 5'
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build EDK2 OVMF Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          set -xe
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt update
+          sudo apt install -y build-essential nasm git xz-utils git wget \
+            python3 python3-pip acpica-tools uuid-dev
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Git config
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build OVMF
+        run: |
+          set -xe
+          GCC_VERSION=16.1.0
+          GCC_URL=https://mirrors.edge.kernel.org/pub/tools/crosstool/files/bin/x86_64
+          for ARCH in aarch64 loongarch64 riscv64; do
+            wget -q $GCC_URL/$GCC_VERSION/x86_64-gcc-$GCC_VERSION-nolibc-$ARCH-linux.tar.xz
+            tar -xf x86_64-gcc-$GCC_VERSION-nolibc-$ARCH-linux.tar.xz
+            export PATH="$PATH":"$(pwd -P)"/gcc-$GCC_VERSION-nolibc/$ARCH-linux/bin
+          done
+          git clone -q --recursive --depth=1 https://github.com/tianocore/edk2
+          echo "EDK2_UPSTREAM_COMMIT=$(git -C edk2 rev-parse HEAD)" >> $GITHUB_ENV
+          ( cd edk2 && patch -p1 <../ovmf.patch )
+          export PACKAGES_PATH="$(pwd -P)"/edk2
+          export GCC_AARCH64_PREFIX=aarch64-linux-
+          export GCC_LOONGARCH64_PREFIX=loongarch64-linux-
+          export GCC_RISCV64_PREFIX=riscv64-linux-
+          set +e
+          . edk2/edksetup.sh
+          set -e
+          make -C edk2/BaseTools
+          build -b RELEASE -t GCC -a AARCH64 -p ArmVirtPkg/ArmVirtQemu.dsc
+          build -b RELEASE -t GCC -a LOONGARCH64 -p OvmfPkg/LoongArchVirt/LoongArchVirtQemu.dsc
+          build -b RELEASE -t GCC -a RISCV64 -p OvmfPkg/RiscVVirt/RiscVVirtQemu.dsc
+          build -b RELEASE -t GCC -a X64 -p OvmfPkg/OvmfPkgX64.dsc -D FD_SIZE_2MB
+          mkdir -p edk2-ovmf
+          cp Build/ArmVirtQemu-AArch64/RELEASE_GCC/FV/QEMU_EFI.fd  edk2-ovmf/ovmf-code-aarch64.fd
+          cp Build/ArmVirtQemu-AArch64/RELEASE_GCC/FV/QEMU_VARS.fd edk2-ovmf/ovmf-vars-aarch64.fd
+          cp Build/LoongArchVirtQemu/RELEASE_GCC/FV/QEMU_EFI.fd  edk2-ovmf/ovmf-code-loongarch64.fd
+          cp Build/LoongArchVirtQemu/RELEASE_GCC/FV/QEMU_VARS.fd edk2-ovmf/ovmf-vars-loongarch64.fd
+          cp Build/RiscVVirtQemu/RELEASE_GCC/FV/RISCV_VIRT_CODE.fd edk2-ovmf/ovmf-code-riscv64.fd
+          cp Build/RiscVVirtQemu/RELEASE_GCC/FV/RISCV_VIRT_VARS.fd edk2-ovmf/ovmf-vars-riscv64.fd
+          cp Build/OvmfX64/RELEASE_GCC/FV/OVMF_CODE.fd edk2-ovmf/ovmf-code-x86_64.fd
+          cp Build/OvmfX64/RELEASE_GCC/FV/OVMF_VARS.fd edk2-ovmf/ovmf-vars-x86_64.fd
+      - name: Set TAG_DATE Variable
+        run: echo "TAG_DATE=$(date -u +'%Y%m%dT%H%M%SZ')" >> $GITHUB_ENV
+      - name: Create Release Tarballs
+        run: |
+          set -xe
+          dd if=/dev/zero of=edk2-ovmf/ovmf-code-aarch64.fd bs=1 count=0 seek=67108864
+          dd if=/dev/zero of=edk2-ovmf/ovmf-code-riscv64.fd bs=1 count=0 seek=33554432
+          dd if=/dev/zero of=edk2-ovmf/ovmf-vars-aarch64.fd bs=1 count=0 seek=67108864
+          dd if=/dev/zero of=edk2-ovmf/ovmf-vars-riscv64.fd bs=1 count=0 seek=33554432
+          tar -Jcvf edk2-ovmf.tar.xz edk2-ovmf
+          tar -zcvf edk2-ovmf.tar.gz edk2-ovmf
+      - name: Tag Release
+        run: |
+          set -xe
+          git tag $TAG_DATE
+          git push --tags
+      - name: Create Release Page
+        uses: softprops/action-gh-release@v3
+        with:
+          name: EDK2 OVMF Build ${{ env.TAG_DATE }}
+          tag_name: ${{ env.TAG_DATE }}
+          body: EDK2 OVMF Images ${{ env.TAG_DATE }}
+          files: |
+            edk2-ovmf.tar.xz
+            edk2-ovmf.tar.gz
+            edk2-ovmf/*
